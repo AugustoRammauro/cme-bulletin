@@ -65,7 +65,7 @@ def _cells(r) -> list:
         f"{r.settlement_pct:.2f}",
         f"{r.delta_rth:.2f}",
         r.signal,
-        r.contract,
+        cb.contract_code(r.instrument, r.contract),
         f"{r.session_open:.10g}",
     ]
 

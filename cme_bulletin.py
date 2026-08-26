@@ -85,6 +85,27 @@ LAYOUTS = {
 }
 
 MONTH_RE = re.compile(r"^[A-Z]{3}\d{2}$")
+
+# Standard futures delivery-month letters.
+MONTH_CODES = {"JAN": "F", "FEB": "G", "MAR": "H", "APR": "J",
+               "MAY": "K", "JUN": "M", "JUL": "N", "AUG": "Q",
+               "SEP": "U", "OCT": "V", "NOV": "X", "DEC": "Z"}
+
+
+def contract_code(instrument: str, month: str) -> str:
+    """
+    'CL' + 'OCT26' -> 'CLV26', the standard futures symbol.
+
+    Also solves a real problem downstream: a spreadsheet reading a CSV will
+    happily parse the bare string 'OCT26' as 1 October 2026 and store a date
+    serial, so the contract month arrives as '46321'. 'CLV26' cannot be
+    mistaken for a date.
+    """
+    stem, year = month[:3].upper(), month[3:]
+    letter = MONTH_CODES.get(stem)
+    if letter is None:
+        return f"{instrument}-{month}"
+    return f"{instrument}{letter}{year}"
 # Price/volume flags the bulletin appends or prepends to a number:
 #   B=bid A=ask N=nominal P=post-settlement R=record #=new high *=new low
 FLAG_RE = re.compile(r"^[#*]?(-?[\d,.]+)[BANPR]*$")
