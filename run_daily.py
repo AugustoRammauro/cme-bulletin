@@ -121,7 +121,13 @@ def main() -> int:
     else:
         tmp = tempfile.TemporaryDirectory()
         log("Downloading bulletin sections...")
-        paths = fetch.fetch_all(cb.SECTIONS, pathlib.Path(tmp.name))
+        try:
+            paths = fetch.fetch_all(cb.SECTIONS, pathlib.Path(tmp.name))
+        except fetch.FetchError as exc:
+            tmp.cleanup()
+            log(f"DOWNLOAD FAILED: {exc}")
+            return 1
+        log("Downloaded all three sections.")
 
     try:
         rows = cb.extract(paths, require_final=True)

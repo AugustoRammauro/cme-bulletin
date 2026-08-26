@@ -220,3 +220,37 @@ def test_csv_has_no_thousands_separators(history, monkeypatch):
 ])
 def test_signal_rules(pct, oi, drth, expected):
     assert cb.signal(pct, oi, drth) == expected
+
+
+# ------------------------------------------------------- spreadsheet safety --
+
+@pytest.mark.parametrize("inst,month,expected", [
+    ("CL", "OCT26", "CL OCT26"),
+    ("ES", "SEP26", "ES SEP26"),
+    ("GC", "DEC26", "GC DEC26"),
+    ("SI", "MAR27", "SI MAR27"),
+])
+def test_contract_code(inst, month, expected):
+    assert cb.contract_code(inst, month) == expected
+
+
+def test_no_csv_value_can_be_read_as_a_date_by_a_spreadsheet(history, monkeypatch):
+    """
+    'OCT26' in a CSV is silently parsed as 1 Oct 2026 and stored as the serial
+    46321, which is how the contract month arrived in the sheet as a number.
+    Only the Date column may look like a date.
+    """
+    import re as _re
+    day = dt.date.today()
+    _run(monkeypatch, [_row("CL", day)])
+    rows = list(csv.reader(history.read_text().splitlines()))
+    date_col = run_daily.COLUMNS.index("Date")
+    # Only a bare month name triggers the coercion. 'GC DEC26' is safe because
+    # the instrument prefix stops it looking like a date; 'DEC26' is not.
+    months = "|".join(cb.MONTH_CODES)
+    monthish = _re.compile(rf"^({months})-?\d{{2}}$", _re.IGNORECASE)
+    for row in rows[1:]:
+        for i, cell in enumerate(row):
+            if i == date_col:
+                continue
+            assert not monthish.match(cell), f"{cell!r} in {run_daily.COLUMNS[i]!r}"

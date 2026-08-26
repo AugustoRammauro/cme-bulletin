@@ -115,7 +115,7 @@ which is a pass.
 | Settlement % Chg | derived, in percent units (`-3.12` means −3.12%) |
 | Delta RTH | `(settlement − session open) / session open`, same units |
 | Signal | Bullish / Sideways / Bearish, see below |
-| Contract | which month the settlement came from |
+| Contract | NinjaTrader notation, e.g. `GC DEC26` |
 | Session Open | the open Delta RTH was measured against |
 
 The last two exist so any settlement or Delta RTH figure can be traced back to
