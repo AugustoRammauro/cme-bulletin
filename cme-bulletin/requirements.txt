@@ -1,0 +1,6 @@
+pdfplumber>=0.11
+tzdata>=2024.1
+
+# Only needed for the optional direct-to-Sheets route (sheets.py):
+# gspread>=6.0
+# google-auth>=2.30
