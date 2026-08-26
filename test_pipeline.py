@@ -254,3 +254,19 @@ def test_no_csv_value_can_be_read_as_a_date_by_a_spreadsheet(history, monkeypatc
             if i == date_col:
                 continue
             assert not monthish.match(cell), f"{cell!r} in {run_daily.COLUMNS[i]!r}"
+
+
+def test_percent_columns_are_fractions(history, monkeypatch):
+    """
+    A spreadsheet's Percent format multiplies by 100. So 3.12% must be stored
+    as 0.0312, not 3.12 - the latter renders as 312%.
+    """
+    row = _row("CL", dt.date.today())
+    row.settlement_pct, row.delta_rth = -3.12, 0.29   # percent units in the Row
+    _run(monkeypatch, [row])
+    rows = list(csv.reader(history.read_text().splitlines()))
+    cells = rows[1]
+    for col, want in (("Settlement % Chg", -0.0312), ("Delta RTH", 0.0029)):
+        got = float(cells[run_daily.COLUMNS.index(col)])
+        assert got == pytest.approx(want), col
+        assert abs(got) < 1, f"{col} looks like percent units, not a fraction"

@@ -51,9 +51,16 @@ def before_release(now=None) -> bool:
 
 
 def _cells(r) -> list:
-    """One Row -> CSV cells. Plain numbers, no thousands separators, so the
-    file stays valid CSV and arrives in the sheet as numbers, not text.
-    Percentages are written in percent units (-3.12 means -3.12%)."""
+    """
+    One Row -> CSV cells.
+
+    Plain numbers, no thousands separators, so the file stays valid CSV and
+    arrives in the sheet as numbers rather than text.
+
+    Percentages are written as FRACTIONS: -0.0312 means -3.12%. That is what
+    a spreadsheet's Percent format expects, since it multiplies by 100 on
+    display. Writing 3.12 for 3.12% would render as 312%.
+    """
     return [
         r.instrument,
         r.trade_date.strftime("%d/%m/%Y"),
@@ -62,8 +69,8 @@ def _cells(r) -> list:
         f"{r.oi_change:.0f}",
         f"{r.settlement:.10g}",
         f"{r.settlement_change:.10g}",
-        f"{r.settlement_pct:.2f}",
-        f"{r.delta_rth:.2f}",
+        f"{r.settlement_pct / 100:.6f}",
+        f"{r.delta_rth / 100:.6f}",
         r.signal,
         cb.contract_code(r.instrument, r.contract),
         f"{r.session_open:.10g}",

@@ -112,7 +112,7 @@ which is a pass.
 | Open Interest change | product TOTAL row |
 | Settlement Price | highest-open-interest contract month |
 | Settlement Change | same contract |
-| Settlement % Chg | derived, in percent units (`-3.12` means −3.12%) |
+| Settlement % Chg | derived, as a fraction (`-0.0312` = −3.12%) |
 | Delta RTH | `(settlement − session open) / session open`, same units |
 | Signal | Bullish / Sideways / Bearish, see below |
 | Contract | NinjaTrader notation, e.g. `GC DEC26` |
@@ -120,6 +120,12 @@ which is a pass.
 
 The last two exist so any settlement or Delta RTH figure can be traced back to
 the exact contract month and opening price it came from.
+
+**The two percentage columns are stored as fractions**, which is what a
+spreadsheet's Percent format expects: select columns H and I, then
+Format → Number → Percent, and they render as −3.12%, +0.29% and so on.
+Storing 3.12 for 3.12% would render as 312%, because Percent format
+multiplies by 100.
 
 ## Delta RTH — one rule for all six
 
