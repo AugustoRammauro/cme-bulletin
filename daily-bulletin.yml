@@ -1,0 +1,47 @@
+name: CME daily bulletin
+
+# The bulletin turns FINAL around 10:00 CT. GitHub's cron is UTC-only and can
+# fire several minutes late under load, so rather than betting on one exact
+# firing this runs every 15 minutes across a window that covers 10:15 CT in
+# both CST (UTC-6) and CDT (UTC-5). run_daily.py is idempotent: the first run
+# that finds a FINAL bulletin appends the rows, and every later run that day
+# sees the date already recorded and exits without changing anything.
+on:
+  schedule:
+    - cron: "0,15,30,45 15-20 * * 1-5"
+  workflow_dispatch:                     # lets you run it by hand from the UI
+
+permissions:
+  contents: write                        # to commit history.csv
+
+concurrency:
+  group: cme-bulletin                    # never two runs writing at once
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Fetch bulletin and append rows
+        run: python run_daily.py
+
+      - name: Commit history
+        run: |
+          if [[ -n "$(git status --porcelain history.csv)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add history.csv
+            git commit -m "data: bulletin rows $(date -u +%Y-%m-%d)"
+            git push
+          else
+            echo "No new rows to commit."
+          fi
