@@ -2,8 +2,14 @@
 """
 Daily CME bulletin -> history.csv (which your sheet pulls in).
 
-Safe to run as often as you like. It appends a row only when all of the
-following hold, and otherwise exits quietly with status 0:
+Each run POLLS rather than checking once. GitHub's scheduler is best-effort:
+it delays and silently drops scheduled ticks, so a design that needs a
+particular tick to land at a particular minute will miss days. Instead, any
+tick that does fire keeps re-checking for up to --wait-minutes, which makes a
+single surviving tick enough to capture the day.
+
+A row is written only when all of the following hold, and the run otherwise
+exits quietly with status 0:
 
   * every section's header says FINAL (not PRELIMINARY)
   * all three sections report the same trade date
@@ -20,6 +26,7 @@ import datetime as dt
 import pathlib
 import sys
 import tempfile
+import time
 from zoneinfo import ZoneInfo
 
 import cme_bulletin as cb
@@ -28,6 +35,7 @@ import fetch
 CHICAGO = ZoneInfo("America/Chicago")
 RELEASE_HOUR, RELEASE_MIN = 10, 15      # bulletin goes FINAL around 10:00 CT
 MAX_STALENESS_DAYS = 5                  # refuse a bulletin older than this
+POLL_SECONDS = 300                      # gap between attempts while waiting
 HISTORY = pathlib.Path("history.csv")   # repo root, so no folder is needed
 
 # Column order matches the tracking sheet, with two audit columns appended so
@@ -107,44 +115,72 @@ def write_history(existing: list, fresh: list) -> None:
         w.writerows(all_rows)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true",
-                    help="parse and print, write nothing")
-    ap.add_argument("--ignore-clock", action="store_true",
-                    help="skip the 'too early in the day' guard")
-    ap.add_argument("--pdf-dir", default=None,
-                    help="parse local PDFs instead of downloading")
-    args = ap.parse_args()
+def attempt(pdf_dir: str | None):
+    """
+    One try at getting a FINAL bulletin.
 
-    if not args.ignore_clock and not args.pdf_dir and before_release():
-        log("Before 10:15 CT - the FINAL bulletin is not out yet. Nothing to do.")
-        return 0
-
-    if args.pdf_dir:
-        base = pathlib.Path(args.pdf_dir)
+    Returns the parsed rows, or None if the bulletin is not ready yet.
+    Raises fetch.FetchError if the download itself is broken.
+    """
+    if pdf_dir:
+        base = pathlib.Path(pdf_dir)
         paths = {k: base / f"{v}.pdf" for k, v in cb.SECTIONS.items()}
         tmp = None
     else:
         tmp = tempfile.TemporaryDirectory()
-        log("Downloading bulletin sections...")
-        try:
-            paths = fetch.fetch_all(cb.SECTIONS, pathlib.Path(tmp.name))
-        except fetch.FetchError as exc:
-            tmp.cleanup()
-            log(f"DOWNLOAD FAILED: {exc}")
-            return 1
-        log("Downloaded all three sections.")
-
+        paths = fetch.fetch_all(cb.SECTIONS, pathlib.Path(tmp.name))
     try:
-        rows = cb.extract(paths, require_final=True)
+        return cb.extract(paths, require_final=True)
     except cb.BulletinError as exc:
-        # Not final yet is the normal case on early runs, not a failure.
-        log(f"Not ready: {exc}")
-        return 0
+        log(f"  not ready: {exc}")
+        return None
     finally:
         if tmp:
             tmp.cleanup()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true",
+                    help="parse and print, write nothing")
+    ap.add_argument("--wait-minutes", type=float, default=25.0,
+                    help="how long to keep re-checking for a FINAL bulletin")
+    ap.add_argument("--pdf-dir", default=None,
+                    help="parse local PDFs instead of downloading")
+    args = ap.parse_args()
+
+    deadline = time.monotonic() + args.wait_minutes * 60
+    rows = None
+
+    while True:
+        if not args.pdf_dir and before_release():
+            # Too early for the bulletin to be final. Wait rather than exit:
+            # a tick that fires early is likely the only one we will get.
+            if time.monotonic() < deadline:
+                log("Before 10:15 CT - waiting.")
+                time.sleep(min(POLL_SECONDS, max(1, deadline - time.monotonic())))
+                continue
+            log("Before 10:15 CT and out of waiting time. Nothing to do.")
+            return 0
+
+        log("Checking the bulletin...")
+        try:
+            rows = attempt(args.pdf_dir)
+        except fetch.FetchError as exc:
+            log(f"DOWNLOAD FAILED: {exc}")
+            return 1
+
+        if rows or args.pdf_dir or time.monotonic() >= deadline:
+            break
+        wait = min(POLL_SECONDS, max(1, deadline - time.monotonic()))
+        log(f"  retrying in {wait/60:.1f} min "
+            f"({(deadline - time.monotonic())/60:.0f} min of budget left)")
+        time.sleep(wait)
+
+    if not rows:
+        log("Bulletin never went FINAL within the waiting time. "
+            "A later run will pick it up.")
+        return 0
 
     trade_date = rows[0].trade_date
     age = (dt.datetime.now(CHICAGO).date() - trade_date).days

@@ -167,18 +167,31 @@ Thresholds are `QUIET_PCT` and `STRONG_PCT` in `cme_bulletin.py`.
 
 # Schedule
 
-`0,15,30,45 15-20 * * 1-5` (UTC) — every 15 minutes, Monday to Friday.
+`7,37 15-20 * * 1-5` (UTC) — twice an hour, Monday to Friday.
 
-GitHub's cron is UTC-only and can fire minutes late under load, so instead of
-betting on one exact firing the job runs across a window covering 10:15 CT in
-both CST and CDT. It exits immediately if it's before 10:15 CT, if the bulletin
-still says PRELIMINARY, or if the date is already recorded — so the first run
-that finds FINAL data writes the rows and every run after that is a no-op
-costing a few seconds.
+GitHub's scheduler is best-effort, not a clock. It delays ticks, silently
+drops them under load, and throttles frequent schedules hardest. Measured on
+this repo, an every-15-minutes schedule delivered **2 of 24 ticks** in a day —
+one 3.5 minutes late, one at 23:34 UTC, nearly three hours outside its own
+window.
+
+So the design does not depend on any particular tick landing. It asks for
+fewer ticks, on off-congestion minutes rather than on the hour, and each run
+that does fire **polls internally for 25 minutes** (`--wait-minutes`),
+re-checking every 5 minutes until the bulletin goes FINAL. One surviving tick
+is enough to capture the day. Runs are idempotent, so extra ticks cost seconds
+and change nothing.
+
+A run exits quietly when the bulletin is still PRELIMINARY at the end of its
+budget, or when the date is already recorded.
 
 To change the target time, edit `RELEASE_HOUR` / `RELEASE_MIN` in
-`run_daily.py` and widen the cron window in
+`run_daily.py` and move the cron window in
 `.github/workflows/daily-bulletin.yml` to match.
+
+**If a day is ever missed entirely, it is gone.** The bulletin URL only serves
+the current day, so there is no backfill. If you notice a gap, the data has to
+come from elsewhere.
 
 # Safety checks
 

@@ -1,14 +1,17 @@
 name: CME daily bulletin
 
-# The bulletin turns FINAL around 10:00 CT. GitHub's cron is UTC-only and can
-# fire several minutes late under load, so rather than betting on one exact
-# firing this runs every 15 minutes across a window that covers 10:15 CT in
-# both CST (UTC-6) and CDT (UTC-5). run_daily.py is idempotent: the first run
-# that finds a FINAL bulletin appends the rows, and every later run that day
-# sees the date already recorded and exits without changing anything.
+# The bulletin turns FINAL around 10:00 CT, i.e. 15:00 UTC in CDT and 16:00
+# UTC in CST, so the window below covers both.
+#
+# GitHub's scheduler is best-effort: it delays ticks and silently drops them
+# under load, and it throttles frequent schedules hardest. Measured on this
+# repo, a every-15-minutes schedule delivered 2 of 24 ticks in a day. So this
+# asks for FEWER ticks - twice an hour, on off-congestion minutes rather than
+# on the hour - and run_daily.py polls internally for 25 minutes on each one.
+# One surviving tick is then enough to capture the day.
 on:
   schedule:
-    - cron: "0,15,30,45 15-20 * * 1-5"
+    - cron: "7,37 15-20 * * 1-5"
   workflow_dispatch:                     # lets you run it by hand from the UI
 
 permissions:
@@ -21,6 +24,7 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 35     # above the 25-minute polling budget
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +36,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Fetch bulletin and append rows
-        run: python run_daily.py
+        run: python run_daily.py --wait-minutes 25
 
       - name: Commit history
         run: |

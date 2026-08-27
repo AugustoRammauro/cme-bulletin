@@ -270,3 +270,42 @@ def test_percent_columns_are_fractions(history, monkeypatch):
         got = float(cells[run_daily.COLUMNS.index(col)])
         assert got == pytest.approx(want), col
         assert abs(got) < 1, f"{col} looks like percent units, not a fraction"
+
+
+# ------------------------------------------------------------- polling ------
+
+def test_run_polls_until_the_bulletin_goes_final(history, monkeypatch):
+    """
+    GitHub drops scheduled ticks, so a run that fires must keep trying rather
+    than checking once and giving up.
+    """
+    calls = {"n": 0}
+    day = dt.date.today()
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:                      # still PRELIMINARY
+            raise cb.BulletinError("energy: bulletin is not FINAL yet")
+        return [_row("CL", day)]
+
+    monkeypatch.setattr(run_daily.cb, "extract", flaky)
+    monkeypatch.setattr(run_daily.fetch, "fetch_all", lambda *a, **k: {})
+    monkeypatch.setattr(run_daily.time, "sleep", lambda s: None)
+    monkeypatch.setattr(run_daily.sys, "argv",
+                        ["run_daily.py", "--wait-minutes", "25"])
+    assert run_daily.main() == 0
+    assert calls["n"] == 3, "should have retried until FINAL"
+    assert "CL" in history.read_text()
+
+
+def test_run_gives_up_cleanly_when_the_budget_runs_out(history, monkeypatch):
+    """Never final within the window is a quiet exit 0, not a failure."""
+    monkeypatch.setattr(run_daily.cb, "extract",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            cb.BulletinError("energy: bulletin is not FINAL yet")))
+    monkeypatch.setattr(run_daily.fetch, "fetch_all", lambda *a, **k: {})
+    monkeypatch.setattr(run_daily.time, "sleep", lambda s: None)
+    monkeypatch.setattr(run_daily.sys, "argv",
+                        ["run_daily.py", "--wait-minutes", "0"])
+    assert run_daily.main() == 0
+    assert not history.exists()
