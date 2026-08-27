@@ -2,7 +2,7 @@ name: CME daily bulletin
 
 on:
   schedule:
-    - cron: "0,15,30,45 15-20 * * 1-5"
+    - cron: "7,37 15-20 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   collect:
+    timeout-minutes: 35
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
