@@ -15,11 +15,11 @@ concurrency:
 jobs:
   collect:
     timeout-minutes: 35
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04            # pinned: ubuntu-latest broke this on 19 Oct 2026
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7      # pinned: see README maintenance note
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7  # pinned: see README maintenance note
         with:
           python-version: "3.12"
           cache: pip
