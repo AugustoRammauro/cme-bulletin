@@ -281,10 +281,34 @@ def read_header(pdf) -> tuple[bool, date | None]:
 class Contract:
     month: str
     open: float | None
+    high: float | None
+    low: float | None
     settle: float | None
     settle_change: float | None
     volume: float | None
     open_interest: float | None
+
+
+def _high_low(cols) -> tuple:
+    """
+    The session high and low, however the section happens to print them.
+
+    Sections 61 and 62 share one HIGH/LOW column, typeset as two values
+    separated by a slash with no space before it ('85.84 /80.23'), which
+    extracts as the words '85.84' and '/80.23'. Section 11 gives high and
+    low their own columns. Flags (B=bid, A=ask) are stripped by _num.
+    """
+    if "highlow" in cols:                       # globex layout
+        joined = " ".join(cols["highlow"])
+        parts = [p for p in joined.split("/") if p.strip()]
+        if len(parts) >= 2:
+            return _num(parts[0]), _num(parts[1])
+        if len(parts) == 1:                     # only one side quoted
+            return _num(parts[0]), None
+        return None, None
+    hi = _num(cols["high"][0]) if cols.get("high") else None
+    lo = _num(cols["low"][0]) if cols.get("low") else None
+    return hi, lo
 
 
 @dataclass
@@ -335,9 +359,12 @@ def extract_block(pdf, block: str, layout: str) -> Block:
             sett_tokens = cols.get("sett_grp", [])
             settle, chg = _signed(sett_tokens,
                                   sett_tokens[0] if sett_tokens else None)
+            hi, lo = _high_low(cols)
             contracts.append(Contract(
                 month=words[0]["text"],
                 open=_num(cols["open"][0]) if cols.get("open") else None,
+                high=hi,
+                low=lo,
                 settle=settle,
                 settle_change=chg,
                 volume=_num(cols["volume"][0]) if cols.get("volume") else None,
@@ -469,6 +496,8 @@ class Row:
     settlement_change: float
     settlement_pct: float
     session_open: float          # the open Delta RTH is measured from
+    session_high: float | None
+    session_low: float | None
     delta_rth: float
     signal: str
 
@@ -509,6 +538,8 @@ def extract(paths: dict, require_final: bool = True,
             settlement_change=c.settle_change,
             settlement_pct=pct,
             session_open=c.open,
+            session_high=c.high,
+            session_low=c.low,
             delta_rth=d,
             signal=signal(pct, block.total_oi_change, d),
         ))

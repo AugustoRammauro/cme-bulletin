@@ -140,7 +140,7 @@ def _row(ticker, day):
         instrument=ticker, trade_date=day, contract="OCT26",
         volume_total=1.0, oi_total=2.0, oi_change=3.0, settlement=4.0,
         settlement_change=0.5, settlement_pct=1.0, session_open=3.9,
-        delta_rth=1.0, signal="Bullish")
+        session_high=4.2, session_low=3.8, delta_rth=1.0, signal="Bullish")
 
 
 @pytest.fixture
@@ -309,3 +309,147 @@ def test_run_gives_up_cleanly_when_the_budget_runs_out(history, monkeypatch):
                         ["run_daily.py", "--wait-minutes", "0"])
     assert run_daily.main() == 0
     assert not history.exists()
+
+
+# ------------------------------------------------------------ high / low ----
+
+@needs_samples
+def test_session_high_and_low_are_parsed():
+    """
+    Sections 61/62 print high and low in ONE column split by a slash with no
+    leading space ('85.84 /80.23'); Section 11 gives them separate columns.
+    Both shapes must yield the same two numbers.
+    """
+    rows = {r.instrument: r for r in cb.extract(PATHS)}
+    expected = {"CL": (85.84, 80.23),     "GC": (4755.00, 4659.50),
+                "SI": (70.770, 68.180),   "ES": (7714.00, 7660.25),
+                "NQ": (29425.75, 29017.00), "YM": (53797.00, 53426.00)}
+    for t, (hi, lo) in expected.items():
+        assert rows[t].session_high == pytest.approx(hi), t
+        assert rows[t].session_low == pytest.approx(lo), t
+
+
+@needs_samples
+def test_high_low_bracket_the_settlement():
+    """A sanity invariant: settlement cannot sit outside the day's range."""
+    for r in cb.extract(PATHS):
+        assert r.session_low <= r.settlement <= r.session_high, r.instrument
+
+
+def test_highlow_splitter_handles_both_layouts():
+    assert cb._high_low({"highlow": ["85.84", "/80.23"]}) == (85.84, 80.23)
+    assert cb._high_low({"highlow": ["4632.00", "/4626.20"]}) == (4632.0, 4626.2)
+    assert cb._high_low({"highlow": ["70.980B/69.120A"]}) == (70.98, 69.12)
+    assert cb._high_low({"highlow": ["----"]}) == (None, None)
+    assert cb._high_low({"high": ["7714.00"], "low": ["7660.25"]}) == (7714.0, 7660.25)
+
+
+def test_legacy_rows_are_padded_to_the_new_width(history, monkeypatch):
+    """
+    history.csv has 222 rows written before Session High/Low existed. They
+    must be padded, not left ragged, and must still match for de-duplication.
+    """
+    old_cols = run_daily.COLUMNS[:-2]
+    history.write_text(",".join(old_cols) + "\n"
+                       + "CL,15/10/2026,600000,1800000,100,99.5,-0.5,"
+                         "-0.005,-0.004,Bearish,CL DEC26,100.0\n")
+    rows, seen = run_daily.read_history()
+    assert len(rows[0]) == len(run_daily.COLUMNS)
+    assert rows[0][-2:] == ["", ""]
+    assert ("CL", "15/10/2026") in seen
+
+
+# ------------------------------------------------------------- self-heal ----
+
+import cme_web
+
+
+FAKE_VOL = {"totals": {"globex": "154,427", "atClose": "396,810", "change": "-4,115"},
+            "monthData": [{"month": "DEC 2026", "atClose": "396,810"},
+                          {"month": "FEB 2027", "atClose": "12,004"}]}
+FAKE_SETTLE = [{"month": "DEC 26", "open": "4032.8", "high": "4081.0",
+                "low": "4025.5", "settle": "4074.6", "change": "+36.2"},
+               {"month": "FEB 27", "open": "4050.0", "settle": "4099.0",
+                "change": "+36.0"}]
+
+
+def test_web_row_matches_the_bulletin_format():
+    """A self-healed row must be indistinguishable in shape from a bulletin row."""
+    row, why = cme_web.build_row("GC", dt.date(2026, 10, 27), FAKE_VOL, FAKE_SETTLE)
+    assert why is None
+    assert len(row) == len(run_daily.COLUMNS)
+    d = dict(zip(run_daily.COLUMNS, row))
+    assert d["Instrument"] == "GC"
+    assert d["Date"] == "27/10/2026"
+    assert d["Volume (total)"] == "154427"
+    assert d["Open Interest (total)"] == "396810"
+    assert d["Settlement Price"] == "4074.6"
+    assert d["Contract"] == "GC DEC26"            # NinjaTrader notation
+    assert d["Session High"] == "4081"
+    assert d["Session Low"] == "4025.5"
+    assert d["Source"] == "cme-web"
+    # percentages as fractions, same as the bulletin path
+    assert float(d["Settlement % Chg"]) == pytest.approx(36.2 / (4074.6 - 36.2), abs=1e-6)
+
+
+def test_web_row_picks_the_highest_open_interest_contract():
+    """Same contract rule as the bulletin, not simply the front month."""
+    row, _ = cme_web.build_row("GC", dt.date(2026, 10, 27), FAKE_VOL, FAKE_SETTLE)
+    assert dict(zip(run_daily.COLUMNS, row))["Contract"] == "GC DEC26"
+
+
+def test_web_row_survives_missing_high_low():
+    """Field names for the range are unverified; absence must not break the row."""
+    settle = [dict(FAKE_SETTLE[0])]
+    del settle[0]["high"]
+    del settle[0]["low"]
+    row, why = cme_web.build_row("GC", dt.date(2026, 10, 27), FAKE_VOL, settle)
+    assert why is None
+    d = dict(zip(run_daily.COLUMNS, row))
+    assert d["Session High"] == "" and d["Session Low"] == ""
+    assert d["Settlement Price"] == "4074.6"      # the rest still lands
+
+
+def test_web_row_refuses_a_day_with_no_settlements():
+    row, why = cme_web.build_row("GC", dt.date(2026, 10, 27), FAKE_VOL, [])
+    assert row is None and "settlement" in why
+
+
+def test_trade_days_back_skips_weekends():
+    # Thursday 29 Oct 2026 -> the five weekdays before it
+    got = cme_web.trade_days_back(dt.date(2026, 10, 29), 5)
+    assert [f"{d:%a %d}" for d in got] == ["Thu 22", "Fri 23", "Mon 26",
+                                           "Tue 27", "Wed 28"]
+
+
+def test_catch_up_identifies_only_real_gaps(monkeypatch):
+    """Days already recorded must not be re-fetched."""
+    window = cme_web.trade_days_back(dt.date(2026, 10, 29), 5)
+    seen = {(i, f"{d:%d/%m/%Y}") for i in cb.INSTRUMENTS for d in window}
+    seen -= {("GC", f"{window[0]:%d/%m/%Y}")}        # one hole
+    asked = {}
+
+    def fake_fetch(missing, client=None):
+        asked.update(missing)
+        return [], [], types.SimpleNamespace(seen_settlement_keys=None)
+
+    monkeypatch.setattr(run_daily.cme_web, "fetch_missing", fake_fetch)
+    monkeypatch.setattr(run_daily.dt, "datetime", _FrozenNow)
+    run_daily.catch_up(seen)
+    assert list(asked) == ["GC"]
+    assert asked["GC"] == [window[0]]
+
+
+class _FrozenNow(dt.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return dt.datetime(2026, 10, 29, 12, 0, tzinfo=tz)
+
+
+def test_catch_up_never_raises(monkeypatch):
+    """A broken repair must not cost the day's real row."""
+    def boom(*a, **k):
+        raise RuntimeError("CME refused")
+    monkeypatch.setattr(run_daily.cme_web, "fetch_missing", boom)
+    monkeypatch.setattr(run_daily.dt, "datetime", _FrozenNow)
+    assert run_daily.catch_up(set()) == []

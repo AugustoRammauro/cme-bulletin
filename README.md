@@ -117,6 +117,9 @@ which is a pass.
 | Signal | Bullish / Sideways / Bearish, see below |
 | Contract | NinjaTrader notation, e.g. `GC DEC26` |
 | Session Open | the open Delta RTH was measured against |
+| Session High | the day's high — needed for range-expansion work |
+| Session Low | the day's low |
+| Source | `bulletin` or `cme-web`; see Self-healing |
 
 The last two exist so any settlement or Delta RTH figure can be traced back to
 the exact contract month and opening price it came from.
@@ -193,6 +196,66 @@ To change the target time, edit `RELEASE_HOUR` / `RELEASE_MIN` in
 the current day, so there is no backfill. If you notice a gap, the data has to
 come from elsewhere.
 
+## Self-healing
+
+The bulletin only ever serves the *current* trade date. Before this existed, a
+missed run meant the day was gone for good — which is how nine trading days
+were lost permanently in Aug-Oct 2026: three to dropped scheduler ticks, six
+to a runner-image change that went unnoticed for ten days.
+
+So every run now does two things:
+
+1. Records today's FINAL bulletin (the primary job).
+2. Checks the last **5 trade days** and fills anything missing from CME's own
+   product-page endpoints (`cme_web.py`), which still serve about that far
+   back. Any outage shorter than a week now repairs itself.
+
+Step 2 runs even when the bulletin is still PRELIMINARY — a run that finds
+nothing new is exactly the run that should notice older gaps. It can never
+fail the job: any error is logged and swallowed, because today's row matters
+more than repairing history.
+
+**Rows carry a `Source` column**, `bulletin` or `cme-web`. That is not
+decoration. Open interest from the web endpoints does not always agree with
+the bulletin: on 15 Oct gold's OI change was +1,411 there against -1,002 in
+the bulletin, which is enough to flip Signal on a borderline day. Prices
+agree; open interest is the column to treat with suspicion on `cme-web` rows.
+
+Gaps older than the 5-day window cannot be recovered at all — CME's free
+pages stop there, and historical bulletins are behind paid DataMine. That is
+why the watchdog below matters.
+
+## Watchdog
+
+`watchdog.gs` is Apps Script, not part of this repo's runtime. A broken
+pipeline cannot report that it is broken, which is why the October outage ran
+for ten days on nothing but ignorable GitHub failure emails.
+
+It runs on Google's clock, reads the sheet, and emails only when the newest
+trade date is more than 2 business days behind — 1 is normal lag, 2 is a
+dropped run the self-heal absorbs, 3+ means something is actually wrong. It
+also fires if the `IMPORTDATA` formula itself errors. It needs no token and
+touches neither GitHub nor CME, so it cannot fail for the same reason the
+pipeline does.
+
+Setup: spreadsheet -> Extensions -> Apps Script, paste the file, run
+`installWatchdog` once, approve the permission prompt.
+
+## Maintenance: the pinned versions
+
+Three things are pinned on purpose, because leaving them floating is what
+caused the only real data loss so far.
+
+| Pinned | Why | Review |
+|---|---|---|
+| `runs-on: ubuntu-24.04` | `ubuntu-latest` moved to Ubuntu 26 on 19 Oct 2026 and every run died in ~10s. Six trading days were lost permanently. | When GitHub announces 24.04 retirement |
+| `actions/checkout@v7` | v4 targeted Node 20, which GitHub deprecated | Annually |
+| `actions/setup-python@v7` | same | Annually |
+
+A pin prevents surprise breakage; it does not prevent eventual breakage. When
+you bump any of these, run the workflow by hand once and confirm it goes green
+before trusting the schedule again.
+
 # Safety checks
 
 The job is unattended, so it refuses to write rather than write something wrong.
@@ -256,7 +319,9 @@ git push -u origin main
 
 ```
 cme_bulletin.py     PDF parsing, derived measures, signal rule
+cme_web.py          CME product-page endpoints, used for self-healing
 fetch.py            downloads, with cache-busting
+watchdog.gs         Apps Script freshness alert (paste into the sheet)
 run_daily.py        orchestration, safety guards, CSV writing
 sheets.py           OPTIONAL, unused by default - direct Sheets writing
 test_pipeline.py    29 tests, including the two parsing hazards below

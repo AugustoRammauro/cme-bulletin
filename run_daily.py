@@ -30,6 +30,7 @@ import time
 from zoneinfo import ZoneInfo
 
 import cme_bulletin as cb
+import cme_web
 import fetch
 
 CHICAGO = ZoneInfo("America/Chicago")
@@ -45,7 +46,10 @@ COLUMNS = [
     "Instrument", "Date", "Volume (total)", "Open Interest (total)",
     "Open Interest change", "Settlement Price", "Settlement Change",
     "Settlement % Chg", "Delta RTH", "Signal", "Contract", "Session Open",
+    "Session High", "Session Low", "Source",
 ]
+
+CATCH_UP_DAYS = 5      # CME's web endpoints serve about this many trade days
 
 
 def log(msg: str) -> None:
@@ -82,6 +86,9 @@ def _cells(r) -> list:
         r.signal,
         cb.contract_code(r.instrument, r.contract),
         f"{r.session_open:.10g}",
+        "" if r.session_high is None else f"{r.session_high:.10g}",
+        "" if r.session_low is None else f"{r.session_low:.10g}",
+        "bulletin",
     ]
 
 
@@ -93,6 +100,8 @@ def read_history() -> tuple[list, set]:
         rows = list(csv.reader(fh))
     if rows and rows[0] and rows[0][0] == COLUMNS[0]:
         rows = rows[1:]
+    width = len(COLUMNS)
+    rows = [r + [""] * (width - len(r)) if len(r) < width else r for r in rows]
     seen = {(r[0].strip().upper(), r[1].strip()) for r in rows if len(r) >= 2}
     return rows, seen
 
@@ -139,6 +148,48 @@ def attempt(pdf_dir: str | None):
             tmp.cleanup()
 
 
+def catch_up(seen: set) -> list:
+    """
+    Fill any of the last few trade days that are missing, from CME's web
+    endpoints.
+
+    This is what makes a missed day survivable. The bulletin only ever serves
+    the current trade date, so before this existed a dropped run meant the day
+    was gone for good — that is how nine trading days were lost permanently.
+
+    It never raises. Today's row is the job's primary purpose, and a failure
+    to repair history must not put that at risk.
+    """
+    try:
+        window = cme_web.trade_days_back(dt.datetime.now(CHICAGO).date(),
+                                         CATCH_UP_DAYS)
+        missing = {}
+        for inst in cb.INSTRUMENTS:
+            gaps = [d for d in window
+                    if (inst, d.strftime("%d/%m/%Y")) not in seen]
+            if gaps:
+                missing[inst] = gaps
+        if not missing:
+            log(f"Catch-up: last {CATCH_UP_DAYS} trade days are all present.")
+            return []
+
+        span = sorted({d for days in missing.values() for d in days})
+        log(f"Catch-up: {len(span)} day(s) missing "
+            f"({', '.join(f'{d:%d/%m}' for d in span)}) - asking CME.")
+        rows, problems, client = cme_web.fetch_missing(missing)
+        if client.seen_settlement_keys:
+            log(f"  settlement fields available: "
+                f"{', '.join(client.seen_settlement_keys)}")
+        for p in problems:
+            log(f"  could not fill {p}")
+        if rows:
+            log(f"Catch-up: recovered {len(rows)} row(s).")
+        return rows
+    except Exception as exc:                          # noqa: BLE001
+        log(f"Catch-up failed, continuing anyway: {type(exc).__name__}: {exc}")
+        return []
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
@@ -177,35 +228,43 @@ def main() -> int:
             f"({(deadline - time.monotonic())/60:.0f} min of budget left)")
         time.sleep(wait)
 
-    if not rows:
-        log("Bulletin never went FINAL within the waiting time. "
-            "A later run will pick it up.")
-        return 0
-
-    trade_date = rows[0].trade_date
-    age = (dt.datetime.now(CHICAGO).date() - trade_date).days
-    if age > MAX_STALENESS_DAYS:
-        log(f"REFUSING: bulletin trade date {trade_date} is {age} days old - "
-            f"probably a stale cached file.")
-        return 1
-    log(f"FINAL bulletin for {trade_date:%d/%m/%Y} parsed - {len(rows)} instruments.")
-
-    for r in rows:
-        log(f"  {r.instrument} {r.contract}  vol {r.volume_total:>11,.0f}  "
-            f"OI {r.oi_total:>11,.0f} ({r.oi_change:+,.0f})  "
-            f"open {r.session_open:.10g} -> settle {r.settlement:.10g} "
-            f"({r.settlement_change:+.10g}, {r.settlement_pct:+.2f}%)  "
-            f"dRTH {r.delta_rth:+.2f}%  {r.signal}")
+    if rows:
+        trade_date = rows[0].trade_date
+        age = (dt.datetime.now(CHICAGO).date() - trade_date).days
+        if age > MAX_STALENESS_DAYS:
+            log(f"REFUSING: bulletin trade date {trade_date} is {age} days old - "
+                f"probably a stale cached file.")
+            return 1
+        log(f"FINAL bulletin for {trade_date:%d/%m/%Y} parsed - "
+            f"{len(rows)} instruments.")
+        for r in rows:
+            log(f"  {r.instrument} {r.contract}  vol {r.volume_total:>11,.0f}  "
+                f"OI {r.oi_total:>11,.0f} ({r.oi_change:+,.0f})  "
+                f"open {r.session_open:.10g} -> settle {r.settlement:.10g} "
+                f"({r.settlement_change:+.10g}, {r.settlement_pct:+.2f}%)  "
+                f"dRTH {r.delta_rth:+.2f}%  {r.signal}")
+    else:
+        log("Bulletin never went FINAL within the waiting time.")
 
     if args.dry_run:
         log("Dry run - nothing written.")
         return 0
 
     existing, seen = read_history()
-    fresh = [_cells(r) for r in rows
+    fresh = [_cells(r) for r in (rows or [])
              if (r.instrument.upper(), r.trade_date.strftime("%d/%m/%Y")) not in seen]
+    if rows and not fresh:
+        log("Today's rows are already recorded.")
+
+    # Repair history even when today produced nothing: a run that finds the
+    # bulletin still preliminary is exactly the run that should notice older
+    # gaps, while CME still serves them.
+    if not args.pdf_dir:
+        after = seen | {(r[0].strip().upper(), r[1].strip()) for r in fresh}
+        fresh += catch_up(after)
+
     if not fresh:
-        log("All rows for this date are already recorded. Nothing written.")
+        log("Nothing to write.")
         return 0
 
     write_history(existing, fresh)
