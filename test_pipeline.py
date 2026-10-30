@@ -422,10 +422,26 @@ def test_web_row_refuses_a_day_with_no_settlements():
 
 
 def test_trade_days_back_skips_weekends():
-    # Thursday 29 Oct 2026 -> the five weekdays before it
-    got = cme_web.trade_days_back(dt.date(2026, 10, 29), 5)
+    got = cme_web.trade_days_back(dt.date(2026, 10, 29), 5, skip_latest=False)
     assert [f"{d:%a %d}" for d in got] == ["Thu 22", "Fri 23", "Mon 26",
                                            "Tue 27", "Wed 28"]
+
+
+def test_repair_window_leaves_the_newest_day_to_the_bulletin():
+    """
+    On 30 Oct the newest trade day is Thu 29. The bulletin publishes it
+    today, and the bulletin's open interest is the authoritative one, so
+    the repair pass must not claim it first.
+    """
+    got = cme_web.trade_days_back(dt.date(2026, 10, 30), 5)
+    assert [f"{d:%a %d}" for d in got] == ["Thu 22", "Fri 23", "Mon 26",
+                                           "Tue 27", "Wed 28"]
+    assert dt.date(2026, 10, 29) not in got
+
+
+def test_a_day_the_bulletin_missed_is_repaired_the_next_day():
+    """Skipping the newest day must defer the repair, not cancel it."""
+    assert dt.date(2026, 10, 29) in cme_web.trade_days_back(dt.date(2026, 11, 2), 5)
 
 
 def test_catch_up_identifies_only_real_gaps(monkeypatch):
@@ -575,11 +591,144 @@ def test_a_malformed_day_does_not_abort_the_whole_repair(monkeypatch):
     class FakeClient:
         seen_settlement_keys = None
         def volume(self, pid, page, day):
-            return {"totals": {"globex": "1"}, "monthData": [{"month": 42}]}
+            return {"tradeDate": f"{day:%Y%m%d}",
+                    "totals": {"globex": "1"}, "monthData": [{"month": 42}]}
         def settlements(self, pid, page, day):
-            return FAKE_SETTLE
+            return {"reportType": "Final", "tradeDate": f"{day:%m/%d/%Y}",
+                    "settlements": FAKE_SETTLE}
     rows, problems, _ = cme_web.fetch_missing(
         {"GC": [dt.date(2026, 10, 22)], "SI": [dt.date(2026, 10, 22)]},
         client=FakeClient())
     assert rows == []
     assert len(problems) == 2            # reported, not raised
+
+
+def test_a_run_too_early_for_the_bulletin_still_repairs_gaps(history, monkeypatch):
+    """
+    In winter the first ticks of the day fall before 10:15 CT and exhaust
+    their budget waiting. Returning there would skip the repair pass
+    entirely - exactly the runs best placed to notice an older gap.
+    """
+    called = {"catch_up": False}
+    def spy(seen):
+        called["catch_up"] = True
+        return []
+    monkeypatch.setattr(run_daily, "before_release", lambda now=None: True)
+    monkeypatch.setattr(run_daily, "catch_up", spy)
+    monkeypatch.setattr(run_daily.time, "sleep", lambda s: None)
+    monkeypatch.setattr(run_daily.sys, "argv",
+                        ["run_daily.py", "--wait-minutes", "0"])
+    assert run_daily.main() == 0
+    assert called["catch_up"], "repair pass was skipped on an early run"
+
+
+# -------------------------------------------------- FINAL on the web path ---
+
+def test_web_path_refuses_preliminary_settlements():
+    """
+    The bulletin path has always required FINAL. The repair path must too,
+    or a preliminary settlement gets recorded permanently.
+    """
+    assert cme_web.check_final(
+        {"reportType": "Final", "tradeDate": "10/29/2026"},
+        dt.date(2026, 10, 29)) is None
+    why = cme_web.check_final(
+        {"reportType": "Preliminary", "tradeDate": "10/29/2026"},
+        dt.date(2026, 10, 29))
+    assert why and "not FINAL" in why
+
+
+def test_web_path_refuses_an_unlabelled_response():
+    why = cme_web.check_final({"tradeDate": "10/29/2026"}, dt.date(2026, 10, 29))
+    assert why and "unlabelled" in why
+
+
+def test_web_path_refuses_the_wrong_trade_date():
+    """A cached or shifted answer must not be filed under the day we asked for."""
+    why = cme_web.check_final(
+        {"reportType": "Final", "tradeDate": "10/28/2026"},
+        dt.date(2026, 10, 29))
+    assert why and "not 29/10/2026" in why
+
+
+def test_preliminary_day_is_skipped_not_written(monkeypatch):
+    class FakeClient:
+        seen_settlement_keys = None
+        def volume(self, pid, page, day):
+            return {"tradeDate": f"{day:%Y%m%d}", "totals": {"globex": "1",
+                    "atClose": "2", "change": "3"},
+                    "monthData": [{"month": "DEC 2026", "atClose": "2"}]}
+        def settlements(self, pid, page, day):
+            return {"reportType": "Preliminary", "tradeDate": f"{day:%m/%d/%Y}",
+                    "settlements": FAKE_SETTLE}
+    rows, problems, _ = cme_web.fetch_missing(
+        {"GC": [dt.date(2026, 10, 23)]}, client=FakeClient())
+    assert rows == []
+    assert "not FINAL" in problems[0]
+
+
+def test_final_day_is_written(monkeypatch):
+    class FakeClient:
+        seen_settlement_keys = None
+        def volume(self, pid, page, day):
+            return {"tradeDate": f"{day:%Y%m%d}", "totals": {"globex": "100",
+                    "atClose": "900", "change": "5"},
+                    "monthData": [{"month": "DEC 2026", "atClose": "900"}]}
+        def settlements(self, pid, page, day):
+            return {"reportType": "Final", "tradeDate": f"{day:%m/%d/%Y}",
+                    "settlements": FAKE_SETTLE}
+    rows, problems, _ = cme_web.fetch_missing(
+        {"GC": [dt.date(2026, 10, 23)]}, client=FakeClient())
+    assert problems == [] and len(rows) == 1
+    assert dict(zip(run_daily.COLUMNS, rows[0]))["Source"] == "cme-web"
+
+
+# ------------------------------------------------ bulletin outranks the web --
+
+def test_bulletin_replaces_a_row_the_repair_pass_filled(history, monkeypatch):
+    """
+    If the repair path got there first because the bulletin was late, the
+    bulletin must overwrite it when it arrives - not be silently discarded.
+    """
+    day = dt.date.today()
+    stamp = day.strftime("%d/%m/%Y")
+    web = ["CL", stamp, "1", "2", "3", "99.0", "0.5", "0.005", "0.004",
+           "Bullish", "CL DEC26", "98.5", "99.9", "98.0", "cme-web"]
+    history.write_text(",".join(run_daily.COLUMNS) + "\n" + ",".join(web) + "\n")
+
+    monkeypatch.setattr(run_daily.cb, "extract", lambda *a, **k: [_row("CL", day)])
+    monkeypatch.setattr(run_daily, "catch_up", lambda seen: [])
+    monkeypatch.setattr(run_daily, "before_release", lambda now=None: False)
+    monkeypatch.setattr(run_daily.sys, "argv", ["run_daily.py", "--pdf-dir", "."])
+    assert run_daily.main() == 0
+
+    rows = list(csv.reader(history.read_text().splitlines()))[1:]
+    assert len(rows) == 1, "should have replaced, not appended"
+    got = dict(zip(run_daily.COLUMNS, rows[0]))
+    assert got["Source"] == "bulletin"
+    assert got["Settlement Price"] == "4"        # from the bulletin row
+
+
+def test_a_bulletin_row_is_never_downgraded(history, monkeypatch):
+    """The reverse must not happen: the web must not overwrite the bulletin."""
+    day = dt.date.today()
+    stamp = day.strftime("%d/%m/%Y")
+    good = ["CL", stamp, "1", "2", "3", "99.0", "0.5", "0.005", "0.004",
+            "Bullish", "CL DEC26", "98.5", "99.9", "98.0", "bulletin"]
+    history.write_text(",".join(run_daily.COLUMNS) + "\n" + ",".join(good) + "\n")
+    _, seen = run_daily.read_history()
+    # catch_up only ever considers keys absent from `seen`
+    assert ("CL", stamp) in seen
+
+
+def test_rerunning_after_an_upgrade_changes_nothing(history, monkeypatch):
+    """Upgrade once, then stay put - no churn on later ticks."""
+    day = dt.date.today()
+    monkeypatch.setattr(run_daily.cb, "extract", lambda *a, **k: [_row("CL", day)])
+    monkeypatch.setattr(run_daily, "catch_up", lambda seen: [])
+    monkeypatch.setattr(run_daily, "before_release", lambda now=None: False)
+    monkeypatch.setattr(run_daily.sys, "argv", ["run_daily.py", "--pdf-dir", "."])
+    run_daily.main()
+    first = history.read_text()
+    run_daily.main()
+    assert history.read_text() == first

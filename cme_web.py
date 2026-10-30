@@ -161,12 +161,42 @@ class Cme:
         raise WebError(f"CME did not answer {path}: {last}")
 
     def settlements(self, pid, page, day):
+        """Returns the whole payload: the caller must see reportType."""
         p = (f"/CmeWS/mvc/Settlements/Futures/Settlements/{pid}/FUT"
              f"?strategy=DEFAULT&tradeDate={day:%m/%d/%Y}&pageSize=500")
-        rows = self.json(p, page).get("settlements") or []
+        data = self.json(p, page)
+        rows = data.get("settlements") or []
         if rows and self.seen_settlement_keys is None:
             self.seen_settlement_keys = sorted(rows[0].keys())
-        return rows
+        return data
+
+
+def check_final(data: dict, day: dt.date):
+    """
+    Refuse anything that is not FINAL for the day we asked about.
+
+    The bulletin path has always enforced this; the repair path did not,
+    which meant a preliminary settlement could be recorded permanently and
+    never corrected. The Settlements endpoint publishes reportType, so the
+    same rule applies here.
+
+    Returns None when acceptable, otherwise the reason to reject.
+    """
+    report = str(data.get("reportType") or "").strip()
+    if report.lower() != "final":
+        return f"settlements are {report or 'unlabelled'}, not FINAL"
+
+    # Guard against the endpoint answering for a different day than asked.
+    stamp = str(data.get("tradeDate") or "").strip()
+    if stamp:
+        for fmt in ("%m/%d/%Y", "%Y%m%d"):
+            try:
+                if dt.datetime.strptime(stamp, fmt).date() != day:
+                    return f"answered for {stamp}, not {day:%d/%m/%Y}"
+                break
+            except ValueError:
+                continue
+    return None
 
     def volume(self, pid, page, day):
         d = f"{day:%Y%m%d}"
@@ -240,14 +270,28 @@ def build_row(inst: str, day: dt.date, vol_json: dict, settle_rows: list):
     return row, None
 
 
-def trade_days_back(today: dt.date, n: int) -> list:
-    """The n most recent weekdays strictly before `today`, oldest first."""
+def trade_days_back(today: dt.date, n: int, skip_latest: bool = True) -> list:
+    """
+    The n weekdays available for repair, oldest first.
+
+    `skip_latest` leaves the most recent trade day alone, because the
+    bulletin is about to publish it and the bulletin is the better source:
+    open interest from the web endpoints does not always agree with it, and
+    whichever source lands first is the one that sticks. Without this the
+    repair pass races the bulletin every morning and usually wins, quietly
+    downgrading the provenance of nearly every row.
+
+    If that day is still missing tomorrow it is no longer the latest, and
+    the repair pass picks it up then.
+    """
     out, d = [], today - dt.timedelta(days=1)
-    while len(out) < n:
+    want = n + 1 if skip_latest else n
+    while len(out) < want:
         if d.weekday() < 5:
             out.append(d)
         d -= dt.timedelta(days=1)
-    return sorted(out)
+    out.sort()
+    return out[:-1] if skip_latest else out
 
 
 def fetch_missing(missing: dict, client=None):
@@ -262,10 +306,22 @@ def fetch_missing(missing: dict, client=None):
         for day in days:
             try:
                 vol = cme.volume(pid, page, day)
-                settle = cme.settlements(pid, page, day)
+                data = cme.settlements(pid, page, day)
             except Exception as exc:                 # noqa: BLE001
                 problems.append(f"{inst} {day:%d/%m}: {exc}")
                 continue
+
+            reject = check_final(data, day)
+            if reject:
+                problems.append(f"{inst} {day:%d/%m}: {reject}")
+                continue
+            # The volume endpoint carries no final/preliminary flag, so the
+            # only guard available there is that it answered for this day.
+            vstamp = str((vol or {}).get("tradeDate") or "").strip()
+            if vstamp and vstamp != f"{day:%Y%m%d}":
+                problems.append(f"{inst} {day:%d/%m}: volume answered for {vstamp}")
+                continue
+            settle = data.get("settlements") or []
             try:
                 row, why = build_row(inst, day, vol, settle)
             except Exception as exc:                 # noqa: BLE001

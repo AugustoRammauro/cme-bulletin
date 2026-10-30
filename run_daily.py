@@ -211,8 +211,12 @@ def main() -> int:
                 log("Before 10:15 CT - waiting.")
                 time.sleep(min(POLL_SECONDS, max(1, deadline - time.monotonic())))
                 continue
-            log("Before 10:15 CT and out of waiting time. Nothing to do.")
-            return 0
+            # Out of budget before the bulletin was even due. Fall through
+            # rather than return: repairing older gaps is still worth doing,
+            # and in winter the first ticks of the day always land here.
+            log("Before 10:15 CT and out of waiting time - no bulletin today, "
+                "but still checking for gaps.")
+            break
 
         log("Checking the bulletin...")
         try:
@@ -251,9 +255,28 @@ def main() -> int:
         return 0
 
     existing, seen = read_history()
-    fresh = [_cells(r) for r in (rows or [])
-             if (r.instrument.upper(), r.trade_date.strftime("%d/%m/%Y")) not in seen]
-    if rows and not fresh:
+    source_col = COLUMNS.index("Source")
+    where = {(r[0].strip().upper(), r[1].strip()): i
+             for i, r in enumerate(existing) if len(r) >= 2}
+
+    # The bulletin outranks the repair path. If a day was filled from the web
+    # because the bulletin was late, replace it once the bulletin arrives:
+    # open interest from the two sources does not always agree, and the
+    # bulletin is the authoritative one.
+    fresh, upgraded = [], 0
+    for r in (rows or []):
+        key = (r.instrument.upper(), r.trade_date.strftime("%d/%m/%Y"))
+        cells = _cells(r)
+        if key not in where:
+            fresh.append(cells)
+            continue
+        row = existing[where[key]]
+        if (row[source_col] if len(row) > source_col else "") != "bulletin":
+            existing[where[key]] = cells
+            upgraded += 1
+    if upgraded:
+        log(f"Upgraded {upgraded} row(s) from cme-web to the bulletin.")
+    if rows and not fresh and not upgraded:
         log("Today's rows are already recorded.")
 
     # Repair history even when today produced nothing: a run that finds the
@@ -263,12 +286,14 @@ def main() -> int:
         after = seen | {(r[0].strip().upper(), r[1].strip()) for r in fresh}
         fresh += catch_up(after)
 
-    if not fresh:
+    if not fresh and not upgraded:
         log("Nothing to write.")
         return 0
 
     write_history(existing, fresh)
-    log(f"Wrote {len(fresh)} row(s) to {HISTORY}.")
+    log(f"Wrote {len(fresh)} new row(s)"
+        + (f" and upgraded {upgraded}" if upgraded else "")
+        + f" in {HISTORY}.")
     return 0
 
 

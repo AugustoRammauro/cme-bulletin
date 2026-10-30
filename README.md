@@ -210,10 +210,29 @@ So every run now does two things:
    product-page endpoints (`cme_web.py`), which still serve about that far
    back. Any outage shorter than a week now repairs itself.
 
+The repair pass deliberately **leaves the newest trade day alone**. The
+bulletin publishes it later the same morning and is the better source, and
+whichever source lands first is the one that sticks. Without that guard the
+repair races the bulletin every day and usually wins, quietly downgrading the
+provenance of nearly every row. If the bulletin never shows up, the day stops
+being newest tomorrow and gets repaired then.
+
 Step 2 runs even when the bulletin is still PRELIMINARY — a run that finds
 nothing new is exactly the run that should notice older gaps. It can never
 fail the job: any error is logged and swallowed, because today's row matters
 more than repairing history.
+
+**Both paths require FINAL data.** The bulletin path reads the word FINAL
+from the PDF header. The repair path checks the Settlements endpoint's
+`reportType` field and refuses anything that is not `Final`, and verifies the
+response is for the day that was asked for. The Volume endpoint, which
+supplies volume and open interest, publishes no such flag - leaving the
+newest day to the bulletin is what keeps that exposure small, since a day two
+or more trade days old is settled.
+
+**The bulletin outranks the repair path.** If a day was filled from the web
+because the bulletin was late, the bulletin replaces it when it arrives. The
+reverse never happens: a `bulletin` row is never overwritten by `cme-web`.
 
 **Rows carry a `Source` column**, `bulletin` or `cme-web`. That is not
 decoration. Open interest from the web endpoints does not always agree with
