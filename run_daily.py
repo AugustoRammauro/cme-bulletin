@@ -73,21 +73,34 @@ def _cells(r) -> list:
     a spreadsheet's Percent format expects, since it multiplies by 100 on
     display. Writing 3.12 for 3.12% would render as 312%.
     """
+    def cell(value, spec=".10g", scale=1.0):
+        """Format a number, or leave the cell empty when CME published none.
+
+        Every one of these can legitimately be absent - a contract that did
+        not trade that session prints '----' for its open, high and low, and
+        the derived percentages then have nothing to divide. Formatting None
+        would raise and fail the whole run, losing the day's other five
+        instruments with it.
+        """
+        if value is None:
+            return ""
+        return format(value * scale, spec)
+
     return [
         r.instrument,
         r.trade_date.strftime("%d/%m/%Y"),
-        f"{r.volume_total:.0f}",
-        f"{r.oi_total:.0f}",
-        f"{r.oi_change:.0f}",
-        f"{r.settlement:.10g}",
-        f"{r.settlement_change:.10g}",
-        f"{r.settlement_pct / 100:.6f}",
-        f"{r.delta_rth / 100:.6f}",
+        cell(r.volume_total, ".0f"),
+        cell(r.oi_total, ".0f"),
+        cell(r.oi_change, ".0f"),
+        cell(r.settlement),
+        cell(r.settlement_change),
+        cell(r.settlement_pct, ".6f", 0.01),
+        cell(r.delta_rth, ".6f", 0.01),
         r.signal,
         cb.contract_code(r.instrument, r.contract),
-        f"{r.session_open:.10g}",
-        "" if r.session_high is None else f"{r.session_high:.10g}",
-        "" if r.session_low is None else f"{r.session_low:.10g}",
+        cell(r.session_open),
+        cell(r.session_high),
+        cell(r.session_low),
         "bulletin",
     ]
 
@@ -242,11 +255,18 @@ def main() -> int:
         log(f"FINAL bulletin for {trade_date:%d/%m/%Y} parsed - "
             f"{len(rows)} instruments.")
         for r in rows:
-            log(f"  {r.instrument} {r.contract}  vol {r.volume_total:>11,.0f}  "
-                f"OI {r.oi_total:>11,.0f} ({r.oi_change:+,.0f})  "
-                f"open {r.session_open:.10g} -> settle {r.settlement:.10g} "
-                f"({r.settlement_change:+.10g}, {r.settlement_pct:+.2f}%)  "
-                f"dRTH {r.delta_rth:+.2f}%  {r.signal}")
+            # Same reason as in _cells: any of these can be absent when a
+            # contract did not trade, and a crash here would cost the whole
+            # run, not just one line of output.
+            def s(v, spec=".10g"):
+                return "----" if v is None else format(v, spec)
+            log(f"  {r.instrument} {r.contract}  "
+                f"vol {s(r.volume_total, '>11,.0f')}  "
+                f"OI {s(r.oi_total, '>11,.0f')} ({s(r.oi_change, '+,.0f')})  "
+                f"open {s(r.session_open)} -> settle {s(r.settlement)} "
+                f"({s(r.settlement_change, '+.10g')}, "
+                f"{s(r.settlement_pct, '+.2f')}%)  "
+                f"dRTH {s(r.delta_rth, '+.2f')}%  {r.signal}")
     else:
         log("Bulletin never went FINAL within the waiting time.")
 

@@ -124,6 +124,19 @@ which is a pass.
 The last two exist so any settlement or Delta RTH figure can be traced back to
 the exact contract month and opening price it came from.
 
+**Which cells can be empty.** On an ordinary trading day every column A-O is
+filled. A cell is left empty only when CME published nothing for it: a
+contract that did not trade prints `----` for open, high and low, and the two
+derived percentages then have nothing to divide. The row is still written
+with everything that *is* known - losing a whole day because one instrument
+was quiet would be the worse outcome.
+
+Rows written before a column existed are padded, not back-filled, so the
+older history has `Session High`, `Session Low` and `Source` blank. Those
+days cannot be recovered: the bulletin only ever serves the current trade
+date. A blank `Source` therefore means "recorded before the column existed",
+which in practice means it came from the bulletin.
+
 **The two percentage columns are stored as fractions**, which is what a
 spreadsheet's Percent format expects: select columns H and I, then
 Format → Number → Percent, and they render as −3.12%, +0.29% and so on.

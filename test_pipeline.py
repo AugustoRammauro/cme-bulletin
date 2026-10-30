@@ -785,3 +785,47 @@ def test_real_client_end_to_end_over_a_stubbed_socket(monkeypatch):
     assert got["Source"] == "cme-web"
     # and it really did warm the page before asking for JSON
     assert sent[0][0].endswith(".settlements.html")
+
+
+# -------------------------------------------------- partial rows are safe ---
+
+def test_a_contract_that_did_not_trade_still_produces_a_row():
+    """
+    A contract printing '----' for open/high/low leaves the derived
+    percentages with nothing to divide. Formatting None raised, which failed
+    the whole run and lost the day's other five instruments too.
+    """
+    r = _row("GC", dt.date(2026, 11, 26))
+    r.settlement_pct = r.delta_rth = None
+    r.session_open = r.session_high = r.session_low = None
+    cells = run_daily._cells(r)
+    assert len(cells) == len(run_daily.COLUMNS)
+    d = dict(zip(run_daily.COLUMNS, cells))
+    assert d["Instrument"] == "GC" and d["Settlement Price"] == "4"
+    for blank in ("Settlement % Chg", "Delta RTH", "Session Open",
+                  "Session High", "Session Low"):
+        assert d[blank] == "", blank
+    assert d["Source"] == "bulletin"
+
+
+def test_one_broken_instrument_does_not_lose_the_others(history, monkeypatch):
+    """The surviving five instruments must still be written."""
+    day = dt.date.today()
+    good = _row("CL", day)
+    bad = _row("GC", day)
+    bad.settlement_pct = bad.delta_rth = bad.session_open = None
+    monkeypatch.setattr(run_daily.cb, "extract", lambda *a, **k: [good, bad])
+    monkeypatch.setattr(run_daily, "catch_up", lambda seen: [])
+    monkeypatch.setattr(run_daily, "before_release", lambda now=None: False)
+    monkeypatch.setattr(run_daily.sys, "argv", ["run_daily.py", "--pdf-dir", "."])
+    assert run_daily.main() == 0
+    rows = list(csv.reader(history.read_text().splitlines()))[1:]
+    assert sorted(r[0] for r in rows) == ["CL", "GC"]
+
+
+def test_every_column_is_filled_on_a_normal_day():
+    """On an ordinary trading day no cell should be blank."""
+    r = _row("CL", dt.date(2026, 10, 29))
+    cells = run_daily._cells(r)
+    blanks = [c for c, v in zip(run_daily.COLUMNS, cells) if v == ""]
+    assert blanks == [], f"unexpectedly blank: {blanks}"
