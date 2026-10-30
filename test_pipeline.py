@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import json
 import pathlib
 import types
 
@@ -732,3 +733,55 @@ def test_rerunning_after_an_upgrade_changes_nothing(history, monkeypatch):
     first = history.read_text()
     run_daily.main()
     assert history.read_text() == first
+
+
+# ------------------------------------------- the real client's own surface --
+
+def test_cme_client_exposes_the_methods_fetch_missing_calls():
+    """
+    Every other web test injects a fake client, so a break in the real class
+    went unnoticed until it ran on GitHub: a module-level function had been
+    pasted inside the class body, ending it early and swallowing `volume`
+    as a nested function. Assert the real surface.
+    """
+    for name in ("warm", "json", "settlements", "volume"):
+        assert callable(getattr(cme_web.Cme, name, None)), f"Cme.{name} missing"
+    assert callable(getattr(cme_web, "check_final", None)), \
+        "check_final must be module level, not inside Cme"
+
+
+def test_real_client_end_to_end_over_a_stubbed_socket(monkeypatch):
+    """
+    Drive the genuine Cme through warm -> json -> settlements/volume ->
+    build_row, stubbing only the network. This is the path that actually
+    runs on GitHub.
+    """
+    day = dt.date(2026, 10, 23)
+    settle_payload = json.dumps({
+        "reportType": "Final", "tradeDate": f"{day:%m/%d/%Y}",
+        "settlements": [{"month": "DEC 26", "open": "4032.8", "high": "4081.0",
+                         "low": "4025.5", "settle": "4074.6", "change": "+36.2"},
+                        {"month": "Total"}]}).encode()
+    volume_payload = json.dumps({
+        "tradeDate": f"{day:%Y%m%d}",
+        "totals": {"globex": "154,427", "atClose": "396,810", "change": "-4,115"},
+        "monthData": [{"month": "DEC 2026", "atClose": "396,810"},
+                      {"month": "Total", "atClose": "999,999"}]}).encode()
+
+    def behaviour(url, hdrs):
+        if "/CmeWS/mvc/Settlements/" in url:
+            return _FakeResponse(settle_payload)
+        if "/CmeWS/mvc/Volume/" in url:
+            return _FakeResponse(volume_payload)
+        return _FakeResponse(b"<html></html>")
+
+    c, sent = _client(monkeypatch, behaviour)
+    rows, problems, _ = cme_web.fetch_missing({"GC": [day]}, client=c)
+    assert problems == [], problems
+    assert len(rows) == 1
+    got = dict(zip(run_daily.COLUMNS, rows[0]))
+    assert got["Contract"] == "GC DEC26"          # 'Total' row ignored
+    assert got["Session High"] == "4081"
+    assert got["Source"] == "cme-web"
+    # and it really did warm the page before asking for JSON
+    assert sent[0][0].endswith(".settlements.html")

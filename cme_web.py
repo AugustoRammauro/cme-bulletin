@@ -170,6 +170,11 @@ class Cme:
             self.seen_settlement_keys = sorted(rows[0].keys())
         return data
 
+    def volume(self, pid, page, day):
+        d = f"{day:%Y%m%d}"
+        p = f"/CmeWS/mvc/Volume/Details/F/{pid}/{d}/P?tradeDate={d}&pageSize=500"
+        return self.json(p, page)
+
 
 def check_final(data: dict, day: dt.date):
     """
@@ -197,11 +202,6 @@ def check_final(data: dict, day: dt.date):
             except ValueError:
                 continue
     return None
-
-    def volume(self, pid, page, day):
-        d = f"{day:%Y%m%d}"
-        p = f"/CmeWS/mvc/Volume/Details/F/{pid}/{d}/P?tradeDate={d}&pageSize=500"
-        return self.json(p, page)
 
 
 def build_row(inst: str, day: dt.date, vol_json: dict, settle_rows: list):
