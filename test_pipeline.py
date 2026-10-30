@@ -290,6 +290,8 @@ def test_run_polls_until_the_bulletin_goes_final(history, monkeypatch):
 
     monkeypatch.setattr(run_daily.cb, "extract", flaky)
     monkeypatch.setattr(run_daily.fetch, "fetch_all", lambda *a, **k: {})
+    monkeypatch.setattr(run_daily, "catch_up", lambda seen: [])
+    monkeypatch.setattr(run_daily, "before_release", lambda now=None: False)
     monkeypatch.setattr(run_daily.time, "sleep", lambda s: None)
     monkeypatch.setattr(run_daily.sys, "argv",
                         ["run_daily.py", "--wait-minutes", "25"])
@@ -304,6 +306,8 @@ def test_run_gives_up_cleanly_when_the_budget_runs_out(history, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(
                             cb.BulletinError("energy: bulletin is not FINAL yet")))
     monkeypatch.setattr(run_daily.fetch, "fetch_all", lambda *a, **k: {})
+    monkeypatch.setattr(run_daily, "catch_up", lambda seen: [])
+    monkeypatch.setattr(run_daily, "before_release", lambda now=None: False)
     monkeypatch.setattr(run_daily.time, "sleep", lambda s: None)
     monkeypatch.setattr(run_daily.sys, "argv",
                         ["run_daily.py", "--wait-minutes", "0"])
@@ -360,6 +364,8 @@ def test_legacy_rows_are_padded_to_the_new_width(history, monkeypatch):
 
 
 # ------------------------------------------------------------- self-heal ----
+
+import urllib.error
 
 import cme_web
 
@@ -453,3 +459,127 @@ def test_catch_up_never_raises(monkeypatch):
     monkeypatch.setattr(run_daily.cme_web, "fetch_missing", boom)
     monkeypatch.setattr(run_daily.dt, "datetime", _FrozenNow)
     assert run_daily.catch_up(set()) == []
+
+
+# ---------------------------------------------- warming CME's web endpoints --
+
+class _FakeResponse:
+    headers = {}
+    def __init__(self, body=b"<html></html>"): self._b = body
+    def read(self): return self._b
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+
+
+def _client(monkeypatch, behaviour):
+    """A Cme whose network layer is `behaviour(url, headers)`."""
+    c = cme_web.Cme()
+    sent = []
+    def opener_open(req, timeout=None):
+        hdrs = {k.title(): v for k, v in req.header_items()}
+        sent.append((req.full_url, hdrs))
+        return behaviour(req.full_url, hdrs)
+    monkeypatch.setattr(c.opener, "open", opener_open)
+    monkeypatch.setattr(cme_web.time, "sleep", lambda s: None)
+    return c, sent
+
+
+def test_warm_sends_a_complete_browser_header_set(monkeypatch):
+    """
+    The 403 that broke the first live run came from an abbreviated header
+    set on the warm-up page. Akamai judges the whole request shape.
+    """
+    c, sent = _client(monkeypatch, lambda u, h: _FakeResponse())
+    c.warm("/markets/metals/precious/gold")
+    _, hdrs = sent[0]
+    for required in ("User-Agent", "Accept", "Accept-Language", "Referer",
+                     "Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site",
+                     "Upgrade-Insecure-Requests"):
+        assert required in hdrs, required
+    assert hdrs["Sec-Fetch-Dest"] == "document"       # a navigation, not an XHR
+
+
+def test_warm_falls_back_to_another_browser_profile(monkeypatch):
+    """One profile being refused must not end the attempt."""
+    def behaviour(url, hdrs):
+        if "Chrome/" in hdrs["User-Agent"] and "Firefox" not in hdrs["User-Agent"]:
+            raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+        return _FakeResponse()
+    c, sent = _client(monkeypatch, behaviour)
+    profile = c.warm("/markets/metals/precious/gold")
+    assert "Firefox" in profile["User-Agent"]
+    assert any("warmed via firefox" in line for line in c.warm_log)
+
+
+def test_warm_refused_everywhere_raises_a_named_error(monkeypatch):
+    """
+    Previously this escaped as a bare 'HTTP Error 403: Forbidden' from
+    outside the retry loop, which said nothing about which URL failed.
+    """
+    def behaviour(url, hdrs):
+        raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+    c, _ = _client(monkeypatch, behaviour)
+    with pytest.raises(cme_web.WebError) as e:
+        c.warm("/markets/metals/precious/gold")
+    msg = str(e.value)
+    assert "settlements.html" in msg                  # names the URL
+    assert msg.count("HTTP 403") == 3                 # and every profile tried
+
+
+def test_json_warms_first_and_reuses_the_cookie(monkeypatch):
+    """The warm-up happens once per page, not once per request."""
+    def behaviour(url, hdrs):
+        if url.endswith(".settlements.html") or url.endswith(".html"):
+            return _FakeResponse()
+        return _FakeResponse(b'{"settlements": []}')
+    c, sent = _client(monkeypatch, behaviour)
+    page = "/markets/metals/precious/gold"
+    c.json("/CmeWS/mvc/x", page)
+    c.json("/CmeWS/mvc/y", page)
+    warms = [u for u, _ in sent if u.endswith(".settlements.html")]
+    assert len(warms) == 1, "warmed more than once"
+    xhr = [h for u, h in sent if "/CmeWS/" in u][0]
+    assert xhr["Sec-Fetch-Dest"] == "empty"           # XHR, not a navigation
+    assert xhr["X-Requested-With"] == "XMLHttpRequest"
+
+
+def test_json_failure_is_retried_not_escaped(monkeypatch):
+    """A refused XHR must be retried, then reported as a WebError."""
+    calls = {"n": 0}
+    def behaviour(url, hdrs):
+        if url.endswith(".html"):
+            return _FakeResponse()
+        calls["n"] += 1
+        raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+    c, _ = _client(monkeypatch, behaviour)
+    with pytest.raises(cme_web.WebError):
+        c.json("/CmeWS/mvc/x", "/markets/metals/precious/gold")
+    assert calls["n"] == 3, "should have retried three times"
+
+
+def test_total_row_in_volume_data_is_ignored():
+    """
+    CME mixes a 'Total' summary row in with the contract months. Unfiltered
+    it wins the max() and then explodes on month.split().
+    """
+    vol = {"totals": {"globex": "100", "atClose": "900", "change": "1"},
+           "monthData": [{"month": "DEC 2026", "atClose": "500"},
+                         {"month": "Total", "atClose": "999999"}]}
+    row, why = cme_web.build_row("GC", dt.date(2026, 10, 22), vol, FAKE_SETTLE)
+    assert why is None
+    assert dict(zip(run_daily.COLUMNS, row))["Contract"] == "GC DEC26"
+
+
+def test_a_malformed_day_does_not_abort_the_whole_repair(monkeypatch):
+    """One bad day must not cost the other days in the window."""
+    class FakeClient:
+        seen_settlement_keys = None
+        def volume(self, pid, page, day):
+            return {"totals": {"globex": "1"}, "monthData": [{"month": 42}]}
+        def settlements(self, pid, page, day):
+            return FAKE_SETTLE
+    rows, problems, _ = cme_web.fetch_missing(
+        {"GC": [dt.date(2026, 10, 22)], "SI": [dt.date(2026, 10, 22)]},
+        client=FakeClient())
+    assert rows == []
+    assert len(problems) == 2            # reported, not raised

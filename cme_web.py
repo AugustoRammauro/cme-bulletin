@@ -31,6 +31,7 @@ import urllib.error
 import urllib.request
 
 import cme_bulletin as cb
+import fetch
 
 BASE = "https://www.cmegroup.com"
 
@@ -44,9 +45,6 @@ PRODUCTS = {
     "NQ": (146, "/markets/equities/nasdaq/e-mini-nasdaq-100"),
     "YM": (318, "/markets/equities/dow-jones/e-mini-dow"),
 }
-
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 
 class WebError(RuntimeError):
@@ -81,47 +79,84 @@ class Cme:
         self.jar = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.jar))
-        self.warmed = set()
+        self.warmed = {}          # page -> the header profile that worked
+        self.warm_log = []
         self.seen_settlement_keys = None   # logged once, to confirm field names
 
     def _get(self, url, headers):
         req = urllib.request.Request(url, headers=headers)
         with self.opener.open(req, timeout=60) as r:
-            raw = r.read()
-            if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
-                raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
-            return raw
+            return fetch._decode(r)          # handles gzip and deflate
 
-    def warm(self, page):
-        if page in self.warmed:
-            return
-        self._get(BASE + page + ".settlements.html", {
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip",
-        })
-        self.warmed.add(page)
+    def _xhr_headers(self, profile: dict, page: str) -> dict:
+        """
+        XHR headers that stay consistent with the browser we warmed as.
 
-    def json(self, path, page):
-        self.warm(page)
-        headers = {
-            "User-Agent": UA,
+        The identity fields (User-Agent, client hints, language) must match
+        the page request; only the fetch-metadata changes, because this is
+        a background JSON call rather than a navigation.
+        """
+        carry = ("User-Agent", "Accept-Language", "Accept-Encoding",
+                 "Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform",
+                 "Connection")
+        h = {k: v for k, v in profile.items() if k in carry}
+        h.update({
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip",
             "Referer": BASE + page + ".settlements.html",
             "X-Requested-With": "XMLHttpRequest",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
-        }
+        })
+        return h
+
+    def warm(self, page):
+        """
+        Load the settlements page so the session carries a browser's cookies.
+
+        Uses the same complete header profiles as the bulletin downloader,
+        which are known to be accepted from a GitHub runner. An abbreviated
+        header set is refused with 403: Akamai judges the shape of the whole
+        request, not just the User-Agent.
+        """
+        if page in self.warmed:
+            return self.warmed[page]
+
+        url = BASE + page + ".settlements.html"
+        tried = []
+        for name, headers in fetch.PROFILES:
+            profile = dict(headers)
+            profile["Referer"] = BASE + page + ".html"
+            for attempt in range(2):
+                try:
+                    self._get(url, {**profile, **fetch.NO_CACHE})
+                    self.warmed[page] = profile
+                    self.warm_log.append(f"{page}: warmed via {name}")
+                    return profile
+                except urllib.error.HTTPError as exc:
+                    tried.append(f"{name}: HTTP {exc.code}")
+                    break                    # refused; a retry won't help
+                except Exception as exc:     # noqa: BLE001 - transient
+                    tried.append(f"{name}: {type(exc).__name__}")
+                    time.sleep(2 + attempt * 3)
+        raise WebError(f"could not open {url} ({'; '.join(tried)})")
+
+    def json(self, path, page):
         last = None
         for attempt in range(3):
             try:
-                return json.loads(self._get(BASE + path, headers))
+                profile = self.warm(page)
+                return json.loads(self._get(BASE + path,
+                                            self._xhr_headers(profile, page)))
+            except WebError:
+                raise                        # warming failed; already explained
+            except urllib.error.HTTPError as exc:
+                last = f"HTTP {exc.code}"
+                # A 403 here but a warmed page means the cookie went stale.
+                self.warmed.pop(page, None)
+                time.sleep(2 + attempt * 3)
             except (urllib.error.URLError, ValueError) as exc:
-                last = exc
+                last = f"{type(exc).__name__}: {exc}"
                 time.sleep(2 + attempt * 3)
         raise WebError(f"CME did not answer {path}: {last}")
 
@@ -153,6 +188,14 @@ def build_row(inst: str, day: dt.date, vol_json: dict, settle_rows: list):
     if not settle_rows:
         return None, "no settlement prices (CME no longer serves this day)"
 
+    # CME mixes a "Total" summary row in with the contract months, and it
+    # would otherwise win the max() below and then fail to parse.
+    months = [m for m in months
+              if len(str(m.get("month", "")).split()) == 2
+              and str(m["month"]).split()[0].isalpha()]
+    if not months:
+        return None, "no contract months in the volume data"
+
     top = max(months, key=lambda m: num(m.get("atClose")) or 0)
     mon, yr = top["month"].split()                  # "DEC 2026"
     short = f"{mon} {yr[-2:]}"                      # Settlements writes "DEC 26"
@@ -163,10 +206,11 @@ def build_row(inst: str, day: dt.date, vol_json: dict, settle_rows: list):
     settle = _pick(srow, "settle")
     change = _pick(srow, "change")
     opn = _pick(srow, "open")
-    # Field names for the range are not documented; try the likely ones and
-    # leave the columns empty rather than guessing wrong.
-    high = _pick(srow, "high", "highPrice", "dayHigh")
-    low = _pick(srow, "low", "lowPrice", "dayLow")
+    # Confirmed live: a settlements entry carries month, open, high, low,
+    # last, change, settle, volume, openInterest. Expiring months show "-",
+    # which num() reads as missing.
+    high = _pick(srow, "high")
+    low = _pick(srow, "low")
     if settle is None or change is None:
         return None, f"settlement for {short} not published"
 
@@ -222,7 +266,11 @@ def fetch_missing(missing: dict, client=None):
             except Exception as exc:                 # noqa: BLE001
                 problems.append(f"{inst} {day:%d/%m}: {exc}")
                 continue
-            row, why = build_row(inst, day, vol, settle)
+            try:
+                row, why = build_row(inst, day, vol, settle)
+            except Exception as exc:                 # noqa: BLE001
+                problems.append(f"{inst} {day:%d/%m}: bad data ({exc})")
+                continue
             if row:
                 rows.append(row)
             elif why and "no volume" not in why:     # holidays have no volume

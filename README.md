@@ -221,6 +221,19 @@ the bulletin: on 15 Oct gold's OI change was +1,411 there against -1,002 in
 the bulletin, which is enough to flip Signal on a borderline day. Prices
 agree; open interest is the column to treat with suspicion on `cme-web` rows.
 
+The first live attempt was refused with 403 on every request. Two causes,
+both now fixed and covered by tests: the warm-up page was sent with only four
+headers (Akamai judges the whole request shape, not the User-Agent, and the
+bulletin downloader's full browser profiles are reused for it now), and the
+warm-up sat outside the retry loop, so its failure escaped as a bare
+`HTTP Error 403` with no indication of which URL had failed.
+
+A live check of the Settlements endpoint confirmed two things while fixing
+this: 22 October is still served in full, so the gap is recoverable rather
+than aged out, and a settlements entry carries exactly
+`month, open, high, low, last, change, settle, volume, openInterest` — so
+self-healed rows populate Session High and Low like bulletin rows do.
+
 Gaps older than the 5-day window cannot be recovered at all — CME's free
 pages stop there, and historical bulletins are behind paid DataMine. That is
 why the watchdog below matters.
